@@ -152,6 +152,7 @@ function switchTab(tab) {
   if (tab === 'planner') { loadVoyages().then(renderPlannerSelect); }
   if (tab === 'team') { loadBoard(); startTeamTimer(); } else stopTeamTimer();
   if (tab === 'sim') { loadTideTable(); loadDisruptions(); }
+  if (tab === 'laytime') { loadVoyages().then(loadLaytime); }
 }
 function startTeamTimer() {
   stopTeamTimer();
@@ -594,10 +595,206 @@ async function resetScenario() {
   catch (e) { showError(e); }
 }
 
+/* ---------------- 滞期争议 ---------------- */
+const LT_CLASS_LABEL = {
+  FREE: '合同免计', WEATHER_EXCEPTED: '天气停工·港方确认（暂停）',
+  CRANE_FAULT: '岸桥故障·港方设备（仍计时）', PENDING_EVIDENCE: '停工待证（暂计时）',
+  BILLABLE: '正常计时',
+};
+const LT_EVENT_LABEL = {
+  READY: '准备就绪', WEATHER_STOP: '天气停工', WEATHER_RESUME: '天气复工',
+  STOP_START: '作业中断', STOP_END: '恢复作业', REPAIR_RECEIPT: '修复回执',
+  COMPLETED: '完工', PLANNED_STOP: '计划停工预告',
+};
+
+function ltPreset(t) { $('#lt-asof').value = t; loadLaytime(); }
+
+async function loadLaytime() {
+  const sel = $('#lt-voyage');
+  if (!sel.options.length) {
+    sel.innerHTML = state.voyages.map((v) =>
+      `<option value="${v.id}" ${v.voyageNo === 'VOY-L' ? 'selected' : ''}>${esc(v.voyageNo)} · ${esc(v.ship.name)}</option>`).join('');
+  }
+  const vid = Number(sel.value);
+  if (!vid) return;
+  const asOf = $('#lt-asof').value;
+  const mode = $('#lt-mode').value;
+  let st;
+  try {
+    st = await api(`/api/voyages/${vid}/laytime${asOf ? '?asOf=' + asOf + '&' : '?'}mode=${mode}`);
+  } catch (e) {
+    $('#lt-contract').innerHTML = '';
+    $('#lt-summary').innerHTML = `<div class="verdict bad">该船次暂无滞期合同/回执：${esc(e.message)}</div>`;
+    $('#lt-timeline').innerHTML = ''; $('#lt-segments').innerHTML = '';
+    $('#lt-corrections').innerHTML = ''; $('#lt-claims').innerHTML = '';
+    $('#lt-events').innerHTML = ''; $('#lt-versions').innerHTML = '';
+    return;
+  }
+  const [events, versions, corrections] = await Promise.all([
+    api(`/api/voyages/${vid}/laytime/events`),
+    api(`/api/voyages/${vid}/laytime/statements`),
+    api(`/api/voyages/${vid}/laytime/corrections`),
+  ]);
+  renderLtContract(st.contract);
+  renderLtSummary(st);
+  renderLtTimeline(st);
+  renderLtSegments(st);
+  renderLtCorrections(corrections);
+  renderLtClaims(st);
+  renderLtEvents(events);
+  renderLtVersions(versions);
+}
+
+function renderLtContract(c) {
+  $('#lt-contract').innerHTML = `
+    📜 合同条款：准备就绪后 <b>${c.freeMinutes} 分钟免计</b>，之后按 <b>${c.ratePerHour} 元/小时</b>
+    （每分钟 ${c.ratePerMinute} 元）计费；例外规则：<b>${esc(c.exceptionRule)}</b> —— ${esc(c.exceptionRuleText)}`;
+}
+
+function renderLtSummary(st) {
+  if (st.settled === false) {
+    $('#lt-summary').innerHTML = `<div class="verdict bad">⏳ ${esc(st.note)}</div>`;
+    return;
+  }
+  const kindBadge = st.kind === 'FINAL'
+    ? '<span class="badge CONFIRMED">定稿 FINAL</span>'
+    : '<span class="badge STAGED">暂计 PROVISIONAL</span>';
+  $('#lt-summary').innerHTML = `
+    <div class="lt-amount-row">
+      <div class="lt-amount"><span class="lt-currency">¥</span>${st.amount}</div>
+      <div class="lt-amount-meta">
+        ${kindBadge}<br/>
+        可计时 <b>${st.billableMinutes}</b> 分钟 ｜ 起计 ${fmtDT(st.countFrom)} ｜ 截止 ${fmtDT(st.endAt)}<br/>
+        <span class="hint">${esc(st.note || '')}　信息截止 asOf = ${fmtFull(st.asOf)}</span>
+      </div>
+    </div>`;
+}
+
+function renderLtTimeline(st) {
+  if (!st.segments || !st.segments.length) { $('#lt-timeline').innerHTML = ''; return; }
+  const total = st.segments.reduce((s, x) => s + x.minutes, 0) || 1;
+  const bar = st.segments.map((s) =>
+    `<div class="lt-seg lt-${s.segClass}" style="width:${(s.minutes / total * 100).toFixed(2)}%"
+       title="${esc(s.label)} ${fmtDT(s.start)}–${fmtDT(s.end)}（${s.minutes} 分钟）"></div>`).join('');
+  const marks = st.segments.map((s) =>
+    `<span style="left:${(cumMin(st.segments, s) / total * 100).toFixed(2)}%">${fmtDT(s.start).slice(6)}</span>`).join('')
+    + `<span style="left:100%;transform:translateX(-100%)">${fmtDT(st.segments[st.segments.length - 1].end).slice(6)}</span>`;
+  $('#lt-timeline').innerHTML = `
+    <div class="lt-bar">${bar}</div>
+    <div class="lt-marks">${marks}</div>
+    <div class="lt-legend">
+      ${Object.entries(LT_CLASS_LABEL).map(([k, v]) =>
+        `<span><i class="lt-seg lt-${k}" style="display:inline-block;width:12px;height:12px;border-radius:3px"></i> ${v}</span>`).join('')}
+    </div>`;
+}
+function cumMin(segs, s) { let c = 0; for (const x of segs) { if (x === s) break; c += x.minutes; } return c; }
+
+function renderLtSegments(st) {
+  if (!st.segments || !st.segments.length) { $('#lt-segments').innerHTML = ''; return; }
+  $('#lt-segments').innerHTML = `<h3 class="section-title">可质证区段（含双方证据）</h3>
+    <table class="data"><thead><tr><th>区间</th><th>分类</th><th>分钟</th><th>金额(元)</th><th>证据回执</th></tr></thead><tbody>
+    ${st.segments.map((s) => `<tr class="${s.billable ? '' : 'lt-row-muted'}">
+      <td class="mono">${fmtDT(s.start)} → ${fmtDT(s.end)}</td>
+      <td><span class="lt-tag lt-${s.segClass}">${esc(s.label)}</span></td>
+      <td>${s.minutes}</td>
+      <td>${s.billable ? (s.amount ?? '') : '—'}</td>
+      <td>${(s.evidence || []).map((e) => `
+        <div class="lt-ev"><span class="badge party-${e.party}">${e.party === 'SHIP' ? '船方' : '港方'}</span>
+          <b>${esc(e.evidenceRef || '')}</b> ${esc(LT_EVENT_LABEL[e.eventType] || e.eventType)}
+          ${e.lateByMinutes > 0 ? `<span class="lt-late">迟到${e.lateByMinutes}′</span>` : ''}
+          ${!e.confirmed ? '<span class="lt-unconfirmed">未确认</span>' : ''}
+          <div class="hint">${esc(e.note || '')}</div></div>`).join('') || '<span class="hint">—</span>'}</td>
+    </tr>`).join('')}</tbody></table>`;
+}
+
+function renderLtCorrections(list) {
+  $('#lt-corrections').innerHTML = `<h3 class="section-title">被更正区段（留痕可质证）</h3>
+    ${(list || []).length ? list.map((c) => `
+      <div class="lt-correction">
+        <b>${fmtDT(c.seg_start)} → ${fmtDT(c.seg_end)}</b>：
+        <span class="lt-tag lt-${c.from_class}">${LT_CLASS_LABEL[c.from_class] || c.from_class}</span> →
+        <span class="lt-tag lt-${c.to_class}">${LT_CLASS_LABEL[c.to_class] || c.to_class}</span>
+        <div class="hint">${esc(c.note || '')}（${esc(c.evidence_ref || '')} · ${fmtFull(c.created_at)} 入账）</div>
+      </div>`).join('') : '<p class="hint">暂无更正：当前各版账单区段分类一致。</p>'}`;
+}
+
+function renderLtClaims(st) {
+  const claims = st.claims || [];
+  const planned = st.plannedNotices || [];
+  const late = st.lateReceipts || [];
+  $('#lt-claims').innerHTML = `<h3 class="section-title">主张处置 / 计划预告 / 迟到回执</h3>
+    ${claims.map((c) => `<div class="lt-claim ${c.status}">
+      🗣️ 船方主张（${esc(c.claimCause)}）→ <b>${({ PENDING: '待证', REFUTED: '被港方凭证否定', HONORED: '与港方确认一致' })[c.status] || c.status}</b>
+      <div class="hint">${esc(c.note || '')}</div></div>`).join('')}
+    ${planned.map((p) => `<div class="lt-planned">📅 ${esc(p.evidenceRef || '')} ${fmtDT(p.occurredAt)}–${fmtDT(p.windowEnd)}
+      <div class="hint">⚠️ ${esc(p.warning)}</div></div>`).join('')}
+    ${late.map((l) => `<div class="lt-late-row">🕐 ${esc(l.evidenceRef || '')} 迟到 <b>${l.lateByMinutes}</b> 分钟
+      <div class="hint">发生 ${fmtFull(l.occurredAt)}，送达 ${fmtFull(l.receivedAt)}</div></div>`).join('')}
+    ${!claims.length && !planned.length && !late.length ? '<p class="hint">暂无主张/预告/迟到回执。</p>' : ''}`;
+}
+
+function renderLtEvents(events) {
+  $('#lt-events').innerHTML = (events || []).length ? `<table class="data"><thead><tr>
+      <th>#</th><th>类型</th><th>方</th><th>发生</th><th>送达</th><th>凭证号</th><th>状态</th></tr></thead><tbody>
+    ${events.map((e) => `<tr>
+      <td>${e.id}</td><td>${esc(LT_EVENT_LABEL[e.eventType] || e.eventType)}</td>
+      <td><span class="badge party-${e.party}">${e.party === 'SHIP' ? '船方' : '港方'}</span></td>
+      <td class="mono">${fmtDT(e.occurredAt)}</td><td class="mono">${fmtDT(e.receivedAt)}</td>
+      <td>${esc(e.evidenceRef || '')}</td>
+      <td>${e.lateByMinutes > 0 ? `<span class="lt-late">迟到${e.lateByMinutes}′</span>` : ''}
+          ${e.confirmed ? '<span class="lt-ok">港方确认</span>' : '<span class="lt-unconfirmed">未确认</span>'}</td>
+    </tr>`).join('')}</tbody></table>` : '<p class="hint">暂无回执。</p>';
+}
+
+function renderLtVersions(versions) {
+  $('#lt-versions').innerHTML = (versions || []).length ? `<table class="data"><thead><tr>
+      <th>版本</th><th>口径</th><th>信息截止</th><th>可计时分钟</th><th>金额(元)</th><th></th></tr></thead><tbody>
+    ${versions.map((v) => `<tr>
+      <td>v${v.version_no}</td>
+      <td>${v.kind === 'FINAL' ? '<span class="badge CONFIRMED">定稿</span>' : '<span class="badge STAGED">暂计</span>'}
+          ${v.finalized ? '🔒' : ''}</td>
+      <td class="mono">${fmtDT(v.as_of)}</td><td>${v.billable_minutes}</td><td>${v.amount}</td>
+      <td><button class="btn tiny" onclick="ltPreset('${String(v.as_of).slice(0, 16)}')">回看</button></td>
+    </tr>`).join('')}</tbody></table>` : '<p class="hint">暂无账单版本。</p>';
+}
+
+async function submitReceipt() {
+  const vid = Number($('#lt-voyage').value);
+  if (!vid) return;
+  const body = {
+    eventType: $('#lt-ev-type').value,
+    occurredAt: $('#lt-ev-occurred').value,
+    receivedAt: $('#lt-ev-received').value || null,
+    windowEnd: $('#lt-ev-windowend').value || null,
+    claimCause: $('#lt-ev-claim').value || null,
+    evidenceRef: $('#lt-ev-ref').value || null,
+    note: $('#lt-ev-note').value || null,
+  };
+  if (!body.occurredAt) return toast('请填写发生时间', 'error');
+  try {
+    const r = await api(`/api/voyages/${vid}/laytime/events`, { method: 'POST', body });
+    const n = (r.newCorrections || []).length;
+    toast(`✅ 回执已入账 → 账单 v${r.versionNo}（${r.kind === 'FINAL' ? '定稿' : '暂计'} ${r.billableMinutes} 分钟 / ${r.amount} 元）`
+      + (n ? `；更正 ${n} 个区段` : ''), 'success');
+    await loadLaytime();
+  } catch (e) { showError(e); }
+}
+
+async function finalizeLaytime() {
+  const vid = Number($('#lt-voyage').value);
+  if (!vid) return;
+  if (!confirm('定稿锁定当前账单？之后不再接受新回执。')) return;
+  try {
+    const r = await api(`/api/voyages/${vid}/laytime/finalize`, { method: 'POST' });
+    toast(`✅ 已定稿：可计时 ${r.billableMinutes} 分钟，应收 ${r.amount} 元`, 'success');
+    await loadLaytime();
+  } catch (e) { showError(e); }
+}
+
 /* ---------------- 回放渲染 ---------------- */
 async function runReplay(kind) {
   const btn = $('#btn-' + kind);
-  ['orderings', 'disruptions', 'full'].forEach((k) => { const b = $('#btn-' + k); if (b) b.disabled = true; });
+  ['orderings', 'disruptions', 'laytime', 'full'].forEach((k) => { const b = $('#btn-' + k); if (b) b.disabled = true; });
   $('#replay-summary').innerHTML = '<div class="verdict ok">⏳ 回放执行中，包含真实 TTL 等待（约 10 秒）与并发竞速…</div>';
   $('#replay-result').innerHTML = '';
   try {
@@ -606,7 +803,7 @@ async function runReplay(kind) {
     state.lastReplay = data;
     renderReplay(data);
   } catch (e) { showError(e); $('#replay-summary').innerHTML = '<div class="verdict bad">回放失败：' + esc(e.message) + '</div>'; }
-  finally { ['orderings', 'disruptions', 'full'].forEach((k) => { const b = $('#btn-' + k); if (b) b.disabled = false; }); }
+  finally { ['orderings', 'disruptions', 'laytime', 'full'].forEach((k) => { const b = $('#btn-' + k); if (b) b.disabled = false; }); }
 }
 
 function renderReplay(data) {

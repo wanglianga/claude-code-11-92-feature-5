@@ -6,6 +6,11 @@
 设备工作区间/转场/周转，并提供潮汐修订、岸桥故障、改靠、ETA 迟到的影响分析与版本化重排；
 已完成的引航/装卸记录在应用层与数据库触发器双层保证不可覆盖。
 
+**滞期争议（本迭代新增）**：把各方回执（准备就绪、天气停工/复工、作业中断/恢复、修复回执、完工）
+与合同规则（免计时长、分钟费率、例外条款）组合成**可质证的可计时区段与金额**；支持边收事件边累计的
+暂计账单与完工定稿两种口径、任意时刻回放（只看该时刻前送达的回执）、迟到回执触发的区段更正留痕、
+双方证据展示；计划停工预告不得替代实际停工凭证，回执入账后不可篡改（DB 触发器）。
+
 - 后端：Java（`--release 21`，已在预装 **JDK 25.0.1** 上构建运行）、Spring Boot 3.5.7、Spring JDBC、PostgreSQL
 - 前端：`src/main/resources/static/` 原生 HTML/CSS/JS 单页（无需 Node 构建）
 - 接口文档：springdoc-openapi，`/swagger-ui.html`
@@ -72,7 +77,41 @@ PostgreSQL 触发器 `trg_occupation_overlap` 在写入前对 `resource_lock` �
 
 ---
 
-## 4. 目录结构
+## 4. 滞期争议：回执 + 合同规则 → 可质证区段与金额
+
+固定样例船次 **VOY-L（远衡 L 轮）**，争议焦点从“停了多久”转为“谁造成停工”：
+
+| 时间 | 事件 | 回执（凭证号 · 方） | 合同处理 |
+| --- | --- | --- | --- |
+| 07:30 | QC-2 计划保养预告 10:30–11:30 | PLAN-QC2-MAINT · 港方 | **预告不作实际停工凭证** |
+| 08:00 | 准备就绪（NOR） | NOR-2026-088 · 船方 | 合同前 2 小时免计 → **10:00 起计** |
+| 10:00–11:00 | 天气停工（阵风 9 级） | PORT-WX-1001/1002 · 港方确认 | **暂停计时**（例外条款） |
+| 11:00–12:30 | 岸桥 QC-2 故障停工 | SHIP-LOG-110/111 · 船方；PORT-QC-REP-207 · 港方 | **仍计时**，归因港方设备 |
+| 12:30 | 修复完成，**回执 13:00 才送达（迟到 30′）** | PORT-QC-REP-207 | 迟到回执**更正 11:00–12:30 区段** |
+| 14:00 | 完工 | PORT-CPL-300 · 港方 | 计时截止 → **定稿** |
+
+**定稿结果：可计时区间 11:00–14:00（180 分钟）× 每分钟 1000/60 元 = 应收 3000 元。**
+
+关键机制：
+
+- **账单是纯函数** `f(截至 asOf 已送达回执, 合同, asOf)`：回放 12:00 时 12:31/13:00/14:00 送达的
+  回执不可见，未闭合停工延伸到 12:00 即止 —— **尚未发生的时长不计入**，12:00 只能显示
+  暂计 60 分钟 / 1000 元。
+- **两种结算口径**（`GET .../laytime?mode=`）：
+  `STREAMING` 边收事件边累计（暂计额随回执增长：0→66.67→1516.67→2000→3000，船代可随时查看，
+  代价是迟到回执会更正区段）；`AT_COMPLETION` 完工收齐再结算（完工回执送达前不出具金额，
+  数字稳定，代价是争议期间没有最终数）。
+- **迟到回执更正留痕**：每条回执入账即重算一版账单（`laytime_statement`），相邻版本间分类变化的
+  区段写入 `laytime_correction` —— 11:00–12:30 由「停工待证」更正为「岸桥故障·港方设备」。
+- **双方证据**：每个区段附定责回执（船方停工报告 + 港方修复回执）；船方“天气延续”主张因无港方
+  确认且被修复回执否定，标记 `REFUTED`；合同只认港方确认凭证。
+- **计划停工不得替代实际停工凭证**：计划保养预告只作展示，不参与区段分类。
+- **回执不可篡改**：`laytime_event` 由触发器 `trg_laytime_event_immutable` 禁止 UPDATE/DELETE；
+  定稿（`POST .../laytime/finalize`）后拒绝新回执（409）。
+
+---
+
+## 5. 目录结构
 
 ```
 pom.xml / Dockerfile / docker-compose.yml
@@ -84,20 +123,21 @@ src/main/resources/
 src/main/java/com/port/berth/
   PortBerthApplication.java
   config/                         # 鉴权拦截器、CORS、OpenAPI、PG 触发器初始化
-  domain/                         # 枚举、Catalog 记录、Eval、ConstraintMath
-  repo/                           # CatalogDao / PlanDao（JdbcTemplate + 行映射）
+  domain/                         # 枚举、Catalog 记录、Eval、ConstraintMath、Laytime（滞期模型）
+  repo/                           # CatalogDao / PlanDao / LaytimeDao（JdbcTemplate + 行映射）
   service/                        # PlanningEngine / PlanService / HoldSweeper
                                   # ExecutionService / DisruptionService / ReplanService
                                   # ReplayService / SeedService / AuthService
-  web/                            # REST 控制器、全局异常处理
-src/test/java/.../                # 4 个纯单元测试（约束数学 + 样例唯一窗口规格）
+                                  # LaytimeEngine（滞期纯函数引擎）/ LaytimeService
+  web/                            # REST 控制器、全局异常处理（含 LaytimeController）
+src/test/java/.../                # 10 个纯单元测试（约束数学 + 样例唯一窗口 + 滞期引擎规格）
 ```
 
 ---
 
-## 5. 一键启动
+## 6. 一键启动
 
-### 5.1 Docker Compose（推荐，干净环境）
+### 6.1 Docker Compose（推荐，干净环境）
 
 ```bash
 cd /workspace/92
@@ -112,9 +152,9 @@ docker compose up --build
 
 > 本任务容器内没有安装 Docker CLI/守护进程，因此镜像构建与 `docker compose up` 未在本会话实际执行；
 > `docker-compose.yml` 已通过 YAML 解析校验，Dockerfile 为标准多阶段构建。应用本身已用等价方式
-> （JDK 25 + 可执行 jar + 真实 PostgreSQL 18）完整验证，见第 7 节。
+> （JDK 25 + 可执行 jar + 真实 PostgreSQL 18）完整验证，见第 8 节。
 
-### 5.2 本地开发（使用任务容器预装运行时）
+### 6.2 本地开发（使用任务容器预装运行时）
 
 PostgreSQL 18 已在 `127.0.0.1:5432` 运行，开发库/账号 `ccdev/ccdev`：
 
@@ -137,7 +177,7 @@ mvn spring-boot:run
 
 ---
 
-## 6. 测试账号
+## 7. 测试账号
 
 | 用户名 | 密码 | 角色 | 能做什么 |
 | --- | --- | --- | --- |
@@ -162,13 +202,15 @@ TOKEN=$(curl -s -X POST http://127.0.0.1:8080/api/auth/login \
 
 ---
 
-## 7. 本题验证方式与实际验证结论
+## 8. 本题验证方式与实际验证结论
 
-### 7.1 自动化验证（本会话实际执行）
+### 8.1 自动化验证（本会话实际执行）
 
 ```bash
 mvn test
-# Tests run: 4, Failures: 0, Errors: 0, Skipped: 0  → BUILD SUCCESS
+# Tests run: 10, Failures: 0, Errors: 0, Skipped: 0  → BUILD SUCCESS
+# （含 LaytimeEngineTest 6 条：定稿 180min/3000 元、12:00 暂计 60min/1000 元、
+#   迟到回执更正区段、计划预告不作凭证、船方单方主张不暂停、迟到 30 分钟标记）
 
 mvn package
 # 生成 target/berth-coordination.jar（约 28 MB，Spring Boot fat jar）
@@ -177,7 +219,7 @@ mvn package
 ```bash
 # 启动 jar 后执行（默认 http://127.0.0.1:8080）
 bash scripts/replay.sh
-# ==> 断言：46/46 通过；allPassed=True
+# ==> 断言：66/66 通过；allPassed=True
 # ALL_REPLAY_CHECKS_PASSED
 ```
 
@@ -190,11 +232,21 @@ bash scripts/replay.sh
   建表/触发器/播种一次成功，回放同样全部通过（验证了 Compose 首次启动的初始化路径）。
 - **HTTP 权限/业务冒烟 8/8**：匿名 401、公开 meta、船代提交船次、船代暂存 403、
   VOY-E ETA 补报状态变 `ETA_UPDATED`、TEAM 看板 200、错误密码 400、OpenAPI 200。
+- **滞期争议 HTTP 冒烟（本迭代实际执行）**：
+  `GET .../laytime?asOf=12:00` → 暂计 60 分钟 / 1000.00 元且区段不越过 12:00；
+  `asOf=13:00` → 11:00–12:30 已更正为 CRANE_FAULT、暂计 120 分钟 / 2000.00 元；
+  最新 → 定稿 180 分钟 / 3000.00 元、可计时区间连续 11:00–14:00；
+  `mode=AT_COMPLETION` 在 12:00 返回 `settled=false, amount=null`、完工后 3000.00 元；
+  版本链 8 版暂计额 0→66.67→1516.67→2000→3000 逐版累计；
+  定稿后新回执 409、船代定稿 403、匿名查询 401；
+  船代提交的天气主张自动标记“未确认”且不暂停计时；
+  `POST /api/replays/laytime` 独立回放 20/20 通过。
 - 前端 `node --check app.js` 通过；所有按钮处理函数均有定义；`/`、`/app.js`、`/styles.css`、
-  `/swagger-ui/index.html` 均实际返回 200。
-- 回放中包含**数据库层自证不可变**：对 `work_record` 直接 `UPDATE/DELETE` 被触发器拒绝。
+  `/swagger-ui/index.html` 均实际返回 200；OpenAPI JSON 含 7 个滞期端点。
+- 回放中包含**数据库层自证不可变**：对 `work_record` 与 `laytime_event` 直接
+  `UPDATE/DELETE` 均被触发器拒绝。
 
-### 7.2 界面手工验证路径
+### 8.2 界面手工验证路径
 
 1. 打开 <http://localhost:8080>，用 `dispatch/dispatch123` 登录（登录页可点账号芯片填充）。
 2. **② 调度工作台** → 选 `VOY-A` → “生成/刷新候选计划”：可见唯一绿色可行卡
@@ -205,14 +257,20 @@ bash scripts/replay.sh
 3. **③ 班组看板**：只有 `CONFIRMED` 方案出现；可开工、登记部分作业量、完成分段。
 4. **④ 模拟与扰动**：修订 21:00 潮位为 `2.20`、插入 QC-2 故障窗口、查看影响项；
    回到调度页对确认方案“扰动后重排”，或用确认卡上的“改靠/改时”。
-5. **⑤ 一键回放验证**：三个按钮分别运行顺序集/扰动集/完整集，页面渲染每条断言与完整 JSON。
-6. **① 船代申报**：可新建船次、对 VOY-E 把 ETA 18–19 补报为 19–20、撤回授权。
+5. **⑤ 滞期争议**：选 `VOY-L`，顶部为合同条款与金额大数字；点 **12:00 争议中** 回放按钮，
+   可见暂计 1000 元、11:00 起黄色“停工待证”区段；点 **13:00 修复回执**，可见该区段被更正为
+   橙色“岸桥故障·仍计时”并出现在“被更正区段”列表；点 **14:00 完工** 或“最新”，
+   可见定稿 3000 元与连续 11:00–14:00 可计时区间；切换“完工收齐再结算”口径，
+   12:00 时无金额。下方为双方回执表（迟到红色标记）、账单版本链（可逐版回看）、
+   回执登记表单与“定稿锁定”按钮。
+6. **⑥ 一键回放验证**：四个按钮分别运行顺序集/扰动集/滞期争议集/完整集，页面渲染每条断言与完整 JSON。
+7. **① 船代申报**：可新建船次、对 VOY-E 把 ETA 18–19 补报为 19–20、撤回授权。
 
 ---
 
-## 8. 一键回放到底核对了什么
+## 9. 一键回放到底核对了什么
 
-`POST /api/replays/orderings`、`/api/replays/disruptions`、`/api/replays/full`
+`POST /api/replays/orderings`、`/api/replays/disruptions`、`/api/replays/laytime`、`/api/replays/full`
 （DISPATCHER/ADMIN）每次先重置固定样例，再输出带断言与完整时间线的报告：
 
 | 回放块 | 核对点（全部 PASS） |
@@ -226,10 +284,11 @@ bash scripts/replay.sh
 | **岸桥故障** | QC-2 20:45–22:30 故障生成 `CRANE_FAULT`；重排为 `SAME_SLOT_REASSIGN`，新分配含 QC-3 不含 QC-2；引航记录保留 |
 | **改靠指令** | 对 VOY-D 下达改靠 B2↔B3：新版本确认且泊位变化；≥4 条 `BERTH_CHANGE` 逐段影响说明 |
 | **ETA 迟到** | ETA 最早时间晚于计划靠泊点时生成 ≥4 条 `ETA_LATE`（引航/拖轮/靠泊/装卸），随后重排出 `CONFIRMED v2` |
+| **滞期争议** | 合同免计 120′/费率 1000 元每小时；回放 12:00 为暂计 60′/1000.00 元且区段不越过 12:00、11:00 起为待证；回放 13:00 时 11:00–12:30 已更正为 `CRANE_FAULT`、暂计 120′/2000.00 元；定稿 `FINAL` 180′/3000.00 元、可计时区间连续 11:00–14:00；被更正区段留痕（`PENDING_EVIDENCE→CRANE_FAULT`，回执 PORT-QC-REP-207）；船方天气主张 `REFUTED`；被更正区段附船方+港方双方证据；计划保养预告未参与区段分类；完工结算口径 12:00 无金额、完工后同额；修复回执迟到 30′；8 条回执生成 8 版账单；DB 阻止 UPDATE/DELETE 回执 |
 
 ---
 
-## 9. 主要 HTTP API
+## 10. 主要 HTTP API
 
 | 方法/路径 | 角色 | 说明 |
 | --- | --- | --- |
@@ -251,12 +310,18 @@ bash scripts/replay.sh
 | `POST /api/plans/{id}/replan` | DISPATCHER+ | 扰动重排（默认自动确认） |
 | `POST /api/plans/{id}/change-berth` | DISPATCHER+ | 改靠/改时指令 |
 | `GET /api/disruptions[/{id}]` | 登录 | 扰动与影响项 |
-| `POST /api/replays/orderings|disruptions|full` | DISPATCHER+ | 一键回放 |
+| `GET /api/voyages/{id}/laytime/contract` | 登录 | 滞期合同条款（免计/费率/例外规则） |
+| `GET/POST /api/voyages/{id}/laytime/events` | 登录 / 全角色 | 回执列表 / 登记回执（提交方按角色：船代→船方，其余→港方） |
+| `GET /api/voyages/{id}/laytime?asOf=&mode=` | 登录 | 任一时刻账单回放；`mode=STREAMING/AT_COMPLETION` |
+| `GET /api/voyages/{id}/laytime/statements` | 登录 | 账单版本链（暂计额逐版累计） |
+| `GET /api/voyages/{id}/laytime/corrections` | 登录 | 被更正区段留痕 |
+| `POST /api/voyages/{id}/laytime/finalize` | DISPATCHER+ | 完工定稿锁定（之后新回执 409） |
+| `POST /api/replays/orderings|disruptions|laytime|full` | DISPATCHER+ | 一键回放 |
 | `POST /api/admin/reset` | DISPATCHER+ | 清空并恢复固定样例 |
 
 ---
 
-## 10. 配置与运维说明
+## 11. 配置与运维说明
 
 - `app.planning.hold-on-stage`、`app.planning.default-hold-ttl-seconds`、
   `app.planning.candidate-step-minutes`、`app.planning.max-wait-minutes` 见 `application.yml`，

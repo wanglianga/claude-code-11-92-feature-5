@@ -275,3 +275,67 @@ CREATE TABLE IF NOT EXISTS impact_item (
     handled     BOOLEAN NOT NULL DEFAULT FALSE
 );
 CREATE INDEX IF NOT EXISTS idx_impact_disruption ON impact_item(disruption_id);
+
+-- ---------- 滞期争议：合同条款 / 双方回执 / 账单版本 / 被更正区段 ----------
+-- 合同条款（每船次一份）：免计时长、小时费率、例外规则
+CREATE TABLE IF NOT EXISTS laytime_contract (
+    id              BIGSERIAL PRIMARY KEY,
+    voyage_id       BIGINT NOT NULL UNIQUE REFERENCES voyage(id),
+    free_minutes    INT NOT NULL,            -- 准备就绪后的免计时长（分钟）
+    rate_per_hour   NUMERIC(12,2) NOT NULL,  -- 费率（元/小时），每分钟 = rate/60
+    exception_rule  VARCHAR(48) NOT NULL DEFAULT 'PORT_CONFIRMED_WEATHER',
+        -- PORT_CONFIRMED_WEATHER：仅港方确认的天气停工暂停计时，其余停工（含设备故障）仍计时
+    remark          TEXT,
+    created_at      TIMESTAMP NOT NULL DEFAULT now()
+);
+
+-- 双方回执/事件（只增不改不删，DB 触发器保证；迟到回执以 received_at > occurred_at 体现）
+CREATE TABLE IF NOT EXISTS laytime_event (
+    id           BIGSERIAL PRIMARY KEY,
+    voyage_id    BIGINT NOT NULL REFERENCES voyage(id),
+    event_type   VARCHAR(24) NOT NULL,
+        -- READY/WEATHER_STOP/WEATHER_RESUME/STOP_START/STOP_END/REPAIR_RECEIPT/COMPLETED/PLANNED_STOP
+    occurred_at  TIMESTAMP NOT NULL,       -- 业务发生时间
+    received_at  TIMESTAMP NOT NULL,       -- 回执送达系统时间（> occurred_at 即迟到回执）
+    party        VARCHAR(8) NOT NULL,      -- SHIP 船方 / PORT 港方
+    confirmed    BOOLEAN NOT NULL DEFAULT FALSE, -- 港方确认（合同只认港方确认凭证）
+    claim_cause  VARCHAR(24),              -- 船方主张的停工原因（STOP_START）：WEATHER/EQUIPMENT/UNKNOWN
+    window_end   TIMESTAMP,                -- REPAIR_RECEIPT / PLANNED_STOP 的窗口结束时间
+    evidence_ref VARCHAR(80),              -- 回执/凭证编号
+    note         TEXT,
+    created_at   TIMESTAMP NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_laytime_event_voyage ON laytime_event(voyage_id, received_at);
+
+-- 账单版本：每收到一条回执即按“截至该回执送达时刻”重算一版暂计/定稿账单
+CREATE TABLE IF NOT EXISTS laytime_statement (
+    id               BIGSERIAL PRIMARY KEY,
+    voyage_id        BIGINT NOT NULL REFERENCES voyage(id),
+    version_no       INT NOT NULL,
+    kind             VARCHAR(16) NOT NULL,   -- PROVISIONAL 暂计 / FINAL 定稿（完工回执到达后）
+    as_of            TIMESTAMP NOT NULL,     -- 本版账单的信息截止时刻
+    ready_at         TIMESTAMP,
+    count_from       TIMESTAMP,              -- 起计时间 = ready_at + free_minutes
+    end_at           TIMESTAMP,              -- 计时截止（完工时间或 as_of）
+    billable_minutes INT NOT NULL DEFAULT 0,
+    amount           NUMERIC(12,2) NOT NULL DEFAULT 0,
+    segments_json    TEXT,                   -- 区段划分与双方证据快照
+    finalized        BOOLEAN NOT NULL DEFAULT FALSE, -- 定稿锁定：之后拒绝新回执
+    created_at       TIMESTAMP NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_laytime_stmt_voyage ON laytime_statement(voyage_id, version_no);
+
+-- 被更正区段：相邻两版账单之间分类发生变化的区段（可质证的更正留痕）
+CREATE TABLE IF NOT EXISTS laytime_correction (
+    id             BIGSERIAL PRIMARY KEY,
+    voyage_id      BIGINT NOT NULL REFERENCES voyage(id),
+    statement_id   BIGINT NOT NULL REFERENCES laytime_statement(id),
+    seg_start      TIMESTAMP NOT NULL,
+    seg_end        TIMESTAMP NOT NULL,
+    from_class     VARCHAR(24) NOT NULL,     -- 更正前分类
+    to_class       VARCHAR(24) NOT NULL,     -- 更正后分类
+    cause_event_id BIGINT,                   -- 引起更正的回执（如迟到的修复回执）
+    note           TEXT,
+    created_at     TIMESTAMP NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_laytime_corr_voyage ON laytime_correction(voyage_id);

@@ -42,7 +42,8 @@
       <button data-tab="planner" class="tab" onclick="switchTab('planner')">② 调度工作台</button>
       <button data-tab="team" class="tab" onclick="switchTab('team')">③ 班组看板</button>
       <button data-tab="sim" class="tab" onclick="switchTab('sim')">④ 模拟与扰动</button>
-      <button data-tab="replay" class="tab" onclick="switchTab('replay')">⑤ 一键回放验证</button>
+      <button data-tab="laytime" class="tab" onclick="switchTab('laytime')">⑤ 滞期争议</button>
+      <button data-tab="replay" class="tab" onclick="switchTab('replay')">⑥ 一键回放验证</button>
     </nav>
     <div class="topbar-right">
       <span id="current-user" class="user-badge"></span>
@@ -149,7 +150,84 @@
       </div>
     </section>
 
-    <!-- ⑤ 回放 -->
+    <!-- ⑤ 滞期争议 -->
+    <section id="tab-laytime" class="tab-panel">
+      <div class="card">
+        <div class="row-between">
+          <h2>滞期争议 · 回执与合同规则 → 可质证区段与金额</h2>
+          <div class="row gap">
+            <select id="lt-voyage" style="min-width:280px" onchange="loadLaytime()"></select>
+            <button class="btn tiny" onclick="loadLaytime()">刷新</button>
+          </div>
+        </div>
+        <div id="lt-contract" class="kv"></div>
+        <div class="lt-controls">
+          <span class="hint">回放时刻：</span>
+          <button class="btn tiny" onclick="ltPreset('2026-11-26T12:00')">12:00 争议中</button>
+          <button class="btn tiny" onclick="ltPreset('2026-11-26T12:31')">12:31 恢复作业</button>
+          <button class="btn tiny" onclick="ltPreset('2026-11-26T13:00')">13:00 修复回执</button>
+          <button class="btn tiny" onclick="ltPreset('2026-11-26T14:00')">14:00 完工</button>
+          <button class="btn tiny" onclick="ltPreset('')">最新</button>
+          <input id="lt-asof" type="datetime-local" />
+          <select id="lt-mode">
+            <option value="STREAMING">边收事件边累计（暂计）</option>
+            <option value="AT_COMPLETION">完工收齐再结算</option>
+          </select>
+          <button class="btn primary tiny" onclick="loadLaytime()">回放/查询</button>
+          <button class="btn success tiny" id="lt-finalize-btn" onclick="finalizeLaytime()">定稿锁定</button>
+        </div>
+        <div id="lt-summary"></div>
+        <div id="lt-timeline"></div>
+        <div id="lt-segments"></div>
+        <div class="grid two-col" style="margin-top:12px">
+          <div id="lt-corrections"></div>
+          <div id="lt-claims"></div>
+        </div>
+      </div>
+
+      <div class="grid two-col">
+        <div class="card">
+          <h2>双方回执（只增不改 · 迟到标记）</h2>
+          <div id="lt-events"></div>
+          <h3 class="section-title">登记回执（提交方由登录角色决定）</h3>
+          <div class="form-grid">
+            <label>类型
+              <select id="lt-ev-type">
+                <option value="READY">READY 准备就绪</option>
+                <option value="WEATHER_STOP">WEATHER_STOP 天气停工</option>
+                <option value="WEATHER_RESUME">WEATHER_RESUME 天气复工</option>
+                <option value="STOP_START">STOP_START 作业中断</option>
+                <option value="STOP_END">STOP_END 恢复作业</option>
+                <option value="REPAIR_RECEIPT">REPAIR_RECEIPT 修复回执</option>
+                <option value="COMPLETED">COMPLETED 完工</option>
+                <option value="PLANNED_STOP">PLANNED_STOP 计划停工预告</option>
+              </select>
+            </label>
+            <label>凭证号 <input id="lt-ev-ref" placeholder="PORT-XXX-001" /></label>
+            <label>发生时间 <input id="lt-ev-occurred" type="datetime-local" /></label>
+            <label>送达时间（晚于发生即迟到） <input id="lt-ev-received" type="datetime-local" /></label>
+            <label>窗口结束（修复/计划） <input id="lt-ev-windowend" type="datetime-local" /></label>
+            <label>船方主张原因
+              <select id="lt-ev-claim">
+                <option value="">—</option>
+                <option value="WEATHER">WEATHER 天气</option>
+                <option value="EQUIPMENT">EQUIPMENT 设备</option>
+                <option value="UNKNOWN">UNKNOWN 待定</option>
+              </select>
+            </label>
+            <label class="span2">说明 <input id="lt-ev-note" placeholder="回执摘要" /></label>
+          </div>
+          <button class="btn primary" onclick="submitReceipt()">提交回执（触发重算）</button>
+          <p class="hint">合同只认港方确认凭证：船代提交的天气主张标记“未确认”，不暂停计时。</p>
+        </div>
+        <div class="card">
+          <h2>账单版本链（边收边累计）</h2>
+          <div id="lt-versions"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ⑥ 回放 -->
     <section id="tab-replay" class="tab-panel">
       <div class="card">
         <h2>固定样例一键回放</h2>
@@ -161,6 +239,7 @@
         <div class="row gap wrap">
           <button class="btn primary big" id="btn-orderings" onclick="runReplay('orderings')">▶ 回放三种顺序 + 并发/策略对照</button>
           <button class="btn warn big" id="btn-disruptions" onclick="runReplay('disruptions')">▶ 回放潮汐/岸桥扰动</button>
+          <button class="btn big" id="btn-laytime" onclick="runReplay('laytime')">▶ 回放滞期争议</button>
           <button class="btn success big" id="btn-full" onclick="runReplay('full')">▶ 完整回放</button>
           <button class="btn danger" onclick="resetScenario()">重置样例数据</button>
         </div>

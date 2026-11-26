@@ -1,6 +1,7 @@
 package com.port.berth.service;
 
 import com.port.berth.domain.Cat;
+import com.port.berth.domain.Laytime;
 import com.port.berth.repo.CatalogDao;
 import com.port.berth.repo.PlanDao;
 import com.port.berth.web.ApiException;
@@ -35,12 +36,14 @@ public class ReplayService {
     private final ExecutionService executionService;
     private final DisruptionService disruptionService;
     private final ReplanService replanService;
+    private final LaytimeService laytimeService;
 
     private static final int HOLD_TTL_SECONDS = 2;
 
     public ReplayService(SeedService seedService, CatalogDao catalog, PlanDao planDao,
                          PlanService planService, ExecutionService executionService,
-                         DisruptionService disruptionService, ReplanService replanService) {
+                         DisruptionService disruptionService, ReplanService replanService,
+                         LaytimeService laytimeService) {
         this.seedService = seedService;
         this.catalog = catalog;
         this.planDao = planDao;
@@ -48,6 +51,7 @@ public class ReplayService {
         this.executionService = executionService;
         this.disruptionService = disruptionService;
         this.replanService = replanService;
+        this.laytimeService = laytimeService;
     }
 
     private LocalDateTime keyTime() {
@@ -145,6 +149,11 @@ public class ReplayService {
     private boolean isConflict(Map<String, Object> attemptResult) {
         return Boolean.FALSE.equals(attemptResult.get("ok"))
                 && Integer.valueOf(409).equals(attemptResult.get("status"));
+    }
+
+    /**跨 Integer/Long 的数值相等判断（statementView 中分钟数为 long）*/
+    private static boolean numEq(Object actual, long expected) {
+        return actual instanceof Number n && n.longValue() == expected;
     }
 
     // ====================================================================
@@ -759,6 +768,217 @@ public class ReplayService {
         out.put("etaImpact", etaImpact);
         out.put("replan", replan);
         return out;
+    }
+
+    // ====================================================================
+    // 滞期争议：回执 + 合同规则 → 可质证区段与金额
+    // ====================================================================
+
+    /**
+     * 固定样例 VOY-L：08:00 就绪、免计 2h、费率 1000/60 元/分钟；
+     * 天气 10:00–11:00（港方确认）暂停；岸桥故障 11:00–12:30 仍计时，
+     * 修复回执 13:00 迟到送达；14:00 完工 → 定稿 11:00–14:00、3000 元。
+     */
+    public Map<String, Object> runLaytime() {
+        seedService.resetAndSeed();
+        List<Map<String, Object>> checks = new ArrayList<>();
+        long vid = voyageId("VOY-L");
+        LocalDateTime d = SeedService.D;
+
+        // ---- 合同条款 ----
+        Map<String, Object> contract = laytimeService.contract(vid);
+        check(checks, "合同：免计 120 分钟、费率 1000 元/小时（每分钟 1000/60 元）",
+                Integer.valueOf(120).equals(contract.get("freeMinutes"))
+                        && "1000.00".equals(String.valueOf(contract.get("ratePerHour"))),
+                "free=120, rate=1000.00",
+                "free=" + contract.get("freeMinutes") + ", rate=" + contract.get("ratePerHour"));
+
+        // ---- 回放 12:00：只能显示暂计额 ----
+        Map<String, Object> at12 = laytimeService.statementView(
+                vid, d.withHour(12), LaytimeService.MODE_STREAMING);
+        check(checks, "回放 12:00 为暂计（PROVISIONAL），不是定稿",
+                Laytime.PROVISIONAL.equals(at12.get("kind")), "PROVISIONAL", at12.get("kind"));
+        check(checks, "回放 12:00 暂计 60 分钟 / 1000.00 元（11:00–12:00 待证计时）",
+                numEq(at12.get("billableMinutes"), 60)
+                        && "1000.00".equals(String.valueOf(at12.get("amount"))),
+                "60min / 1000.00",
+                at12.get("billableMinutes") + "min / " + at12.get("amount"));
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> seg12 = (List<Map<String, Object>>) at12.get("segments");
+        LocalDateTime maxEnd12 = seg12.stream()
+                .map(s -> LocalDateTime.parse(String.valueOf(s.get("end"))))
+                .max(LocalDateTime::compareTo).orElse(null);
+        check(checks, "回放 12:00 不把尚未发生的时长算入（区段不越过 12:00）",
+                maxEnd12 != null && !maxEnd12.isAfter(d.withHour(12)),
+                "maxEnd<=12:00", maxEnd12);
+        check(checks, "回放 12:00 时 11:00 起区段为停工待证（PENDING_EVIDENCE）",
+                seg12.stream().anyMatch(s -> "PENDING_EVIDENCE".equals(s.get("segClass"))
+                        && String.valueOf(s.get("start")).endsWith("11:00")),
+                "PENDING_EVIDENCE 11:00–12:00",
+                seg12.stream().map(s -> s.get("segClass") + " " + s.get("start") + "→" + s.get("end")).toList());
+
+        // ---- 回放 13:00：迟到修复回执已更正 11:00–12:30 区段 ----
+        Map<String, Object> at13 = laytimeService.statementView(
+                vid, d.withHour(13), LaytimeService.MODE_STREAMING);
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> seg13 = (List<Map<String, Object>>) at13.get("segments");
+        check(checks, "回放 13:00 时 11:00–12:30 已更正为岸桥故障（CRANE_FAULT，仍计时）",
+                seg13.stream().anyMatch(s -> "CRANE_FAULT".equals(s.get("segClass"))
+                        && String.valueOf(s.get("start")).endsWith("11:00")
+                        && String.valueOf(s.get("end")).endsWith("12:30")),
+                "CRANE_FAULT 11:00–12:30",
+                seg13.stream().map(s -> s.get("segClass") + " " + s.get("start") + "→" + s.get("end")).toList());
+        check(checks, "回放 13:00 暂计 120 分钟 / 2000.00 元",
+                numEq(at13.get("billableMinutes"), 120)
+                        && "2000.00".equals(String.valueOf(at13.get("amount"))),
+                "120min / 2000.00",
+                at13.get("billableMinutes") + "min / " + at13.get("amount"));
+
+        // ---- 定稿：可计时区间 11:00–14:00，应收 3000 元 ----
+        Map<String, Object> fin = laytimeService.statementView(vid, null, LaytimeService.MODE_STREAMING);
+        check(checks, "完工回执到达后账单为定稿（FINAL）",
+                Laytime.FINAL.equals(fin.get("kind")), "FINAL", fin.get("kind"));
+        check(checks, "定稿可计时 180 分钟 / 应收 3000.00 元",
+                numEq(fin.get("billableMinutes"), 180)
+                        && "3000.00".equals(String.valueOf(fin.get("amount"))),
+                "180min / 3000.00",
+                fin.get("billableMinutes") + "min / " + fin.get("amount"));
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> segFin = (List<Map<String, Object>>) fin.get("segments");
+        List<Map<String, Object>> billableSegs = segFin.stream()
+                .filter(s -> Boolean.TRUE.equals(s.get("billable"))).toList();
+        LocalDateTime billStart = billableSegs.stream()
+                .map(s -> LocalDateTime.parse(String.valueOf(s.get("start"))))
+                .min(LocalDateTime::compareTo).orElse(null);
+        LocalDateTime billEnd = billableSegs.stream()
+                .map(s -> LocalDateTime.parse(String.valueOf(s.get("end"))))
+                .max(LocalDateTime::compareTo).orElse(null);
+        boolean contiguous = true;
+        for (int i = 0; i + 1 < billableSegs.size(); i++) {
+            contiguous &= String.valueOf(billableSegs.get(i).get("end"))
+                    .equals(String.valueOf(billableSegs.get(i + 1).get("start")));
+        }
+        check(checks, "定稿可计时区间为连续的 11:00–14:00",
+                contiguous && billStart != null && billEnd != null
+                        && billStart.equals(d.withHour(11)) && billEnd.equals(d.withHour(14)),
+                "11:00–14:00 连续", billStart + " → " + billEnd);
+
+        // ---- 被更正区段留痕 ----
+        List<Map<String, Object>> corrections = laytimeService.corrections(vid);
+        boolean headline = corrections.stream().anyMatch(c ->
+                "PENDING_EVIDENCE".equals(c.get("from_class"))
+                        && "CRANE_FAULT".equals(c.get("to_class"))
+                        && String.valueOf(c.get("seg_start")).endsWith("11:00")
+                        && String.valueOf(c.get("seg_end")).endsWith("12:30")
+                        && "PORT-QC-REP-207".equals(c.get("evidence_ref")));
+        check(checks, "被更正区段留痕：11:00–12:30 由停工待证更正为岸桥故障（回执 PORT-QC-REP-207）",
+                headline, "存在 PENDING_EVIDENCE→CRANE_FAULT 11:00–12:30",
+                corrections.stream().map(c -> c.get("from_class") + "→" + c.get("to_class")
+                        + " " + c.get("seg_start") + "–" + c.get("seg_end")).toList());
+
+        // ---- 双方证据与船方主张处置 ----
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> claims = (List<Map<String, Object>>) fin.get("claims");
+        check(checks, "船方“天气延续”主张被港方修复回执否定（REFUTED）",
+                claims.stream().anyMatch(c -> "REFUTED".equals(c.get("status"))),
+                "存在 REFUTED 主张", claims);
+        Map<String, Object> craneSeg = segFin.stream()
+                .filter(s -> "CRANE_FAULT".equals(s.get("segClass"))).findFirst().orElse(Map.of());
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> craneEvidence =
+                (List<Map<String, Object>>) craneSeg.getOrDefault("evidence", List.of());
+        check(checks, "被更正区段附双方证据（船方停工报告 + 港方修复回执）",
+                craneEvidence.stream().anyMatch(e -> "SHIP".equals(e.get("party")))
+                        && craneEvidence.stream().anyMatch(e -> "PORT".equals(e.get("party"))),
+                "SHIP+PORT 证据齐全",
+                craneEvidence.stream().map(e -> e.get("party") + ":" + e.get("evidenceRef")).toList());
+
+        // ---- 计划停工不得替代实际停工凭证 ----
+        List<Map<String, Object>> events = laytimeService.events(vid);
+        long plannedId = events.stream()
+                .filter(e -> "PLANNED_STOP".equals(e.get("eventType")))
+                .mapToLong(e -> ((Number) e.get("id")).longValue()).findFirst().orElse(-1);
+        boolean plannedUsed = segFin.stream().flatMap(s -> {
+            @SuppressWarnings("unchecked")
+            List<Map<String, Object>> ev = (List<Map<String, Object>>) s.getOrDefault("evidence", List.of());
+            return ev.stream();
+        }).anyMatch(e -> ((Number) e.get("id")).longValue() == plannedId);
+        check(checks, "计划保养预告 10:30–11:30 未被用作实际停工凭证（区段分类只认实际回执）",
+                plannedId > 0 && !plannedUsed,
+                "PLANNED_STOP 存在且不出现在任何区段证据中",
+                "plannedEventId=" + plannedId + ", usedAsEvidence=" + plannedUsed);
+
+        // ---- 两种结算口径对照 ----
+        Map<String, Object> ac12 = laytimeService.statementView(
+                vid, d.withHour(12), LaytimeService.MODE_AT_COMPLETION);
+        check(checks, "完工结算口径在 12:00 不出具金额（争议期间没有最终数）",
+                Boolean.FALSE.equals(ac12.get("settled")) && ac12.get("amount") == null,
+                "settled=false, amount=null",
+                "settled=" + ac12.get("settled") + ", amount=" + ac12.get("amount"));
+        Map<String, Object> acFin = laytimeService.statementView(
+                vid, null, LaytimeService.MODE_AT_COMPLETION);
+        check(checks, "完工结算口径在完工后给出同一定稿金额 3000.00 元",
+                "3000.00".equals(String.valueOf(acFin.get("amount"))),
+                "3000.00", acFin.get("amount"));
+
+        // ---- 迟到回执标记 ----
+        Map<String, Object> repair = events.stream()
+                .filter(e -> "REPAIR_RECEIPT".equals(e.get("eventType"))).findFirst().orElse(Map.of());
+        check(checks, "修复回执标记迟到 30 分钟（12:30 修复完成，13:00 送达）",
+                numEq(repair.get("lateByMinutes"), 30),
+                30, repair.get("lateByMinutes"));
+
+        // ---- 回执不可变（DB 触发器自证） ----
+        long anyEventId = ((Number) events.get(0).get("id")).longValue();
+        Map<String, Object> updProof = proveLaytimeImmutable(anyEventId, true);
+        Map<String, Object> delProof = proveLaytimeImmutable(anyEventId, false);
+        check(checks, "数据库阻止 UPDATE 已入账回执",
+                Boolean.TRUE.equals(updProof.get("blocked")), true, updProof);
+        check(checks, "数据库阻止 DELETE 已入账回执",
+                Boolean.TRUE.equals(delProof.get("blocked")), true, delProof);
+
+        // ---- 版本链：边收事件边累计 ----
+        List<Map<String, Object>> versions = laytimeService.statements(vid);
+        check(checks, "每条回执生成一个账单版本（8 条回执 → 8 版），暂计额随事件累计",
+                versions.size() == 8, 8, versions.size());
+
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("title", "滞期争议：双方回执 + 合同规则 → 可质证区段与金额（定稿 11:00–14:00 / 3000 元）");
+        out.put("checks", checks);
+        out.put("allPassed", checks.stream().allMatch(c -> Boolean.TRUE.equals(c.get("pass"))));
+        out.put("contract", contract);
+        out.put("replay12", at12);
+        out.put("replay13", at13);
+        out.put("finalStatement", fin);
+        out.put("corrections", corrections);
+        out.put("versionTimeline", versions.stream().map(v -> Map.of(
+                "version", v.get("version_no"), "kind", v.get("kind"),
+                "asOf", v.get("as_of"), "billableMinutes", v.get("billable_minutes"),
+                "amount", v.get("amount"))).toList());
+        out.put("settlementContrast", Map.of(
+                "streamingAt12", Map.of("billableMinutes", at12.get("billableMinutes"),
+                        "amount", at12.get("amount")),
+                "atCompletionAt12", Map.of("settled", ac12.get("settled"),
+                        "amount", ac12.get("amount") == null ? "null" : ac12.get("amount")),
+                "note", "边收边累计让船代及时看到暂计额，但迟到回执会更正区段；完工再结算更稳定，但争议期间没有最终数"));
+        return out;
+    }
+
+    private Map<String, Object> proveLaytimeImmutable(long eventId, boolean update) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        try {
+            if (update) {
+                planDao.jdbc().update(
+                        "UPDATE laytime_event SET note='HACKED' WHERE id=?", eventId);
+            } else {
+                planDao.jdbc().update("DELETE FROM laytime_event WHERE id=?", eventId);
+            }
+            m.put("blocked", false);
+        } catch (Exception e) {
+            m.put("blocked", true);
+            m.put("error", rootMessage(e));
+        }
+        return m;
     }
 
     // ====================================================================

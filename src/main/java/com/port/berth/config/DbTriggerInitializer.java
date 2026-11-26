@@ -79,6 +79,22 @@ public class DbTriggerInitializer implements ApplicationRunner {
                     ON resource_occupation
                     FOR EACH ROW EXECUTE FUNCTION fn_occupation_overlap_guard()
                 """);
-        log.info("数据库触发器初始化完成（作业记录不可变、资源占用互斥）");
+
+        // 3) 滞期回执不可变：双方凭证只增不改不删 --------------------------
+        jdbc.execute("""
+                CREATE OR REPLACE FUNCTION fn_laytime_event_immutable() RETURNS trigger AS $fn$
+                BEGIN
+                    RAISE EXCEPTION 'LAYTIME_EVENT_IMMUTABLE: receipt cannot be changed or deleted (id=%)',
+                        COALESCE(OLD.id, NEW.id) USING ERRCODE = '45000';
+                END;
+                $fn$ LANGUAGE plpgsql
+                """);
+        jdbc.execute("DROP TRIGGER IF EXISTS trg_laytime_event_immutable ON laytime_event");
+        jdbc.execute("""
+                CREATE TRIGGER trg_laytime_event_immutable
+                    BEFORE UPDATE OR DELETE ON laytime_event
+                    FOR EACH ROW EXECUTE FUNCTION fn_laytime_event_immutable()
+                """);
+        log.info("数据库触发器初始化完成（作业记录不可变、资源占用互斥、滞期回执不可变）");
     }
 }

@@ -34,14 +34,22 @@ public class ReplayController {
         return replayService.runDisruptions();
     }
 
+    @PostMapping("/laytime")
+    public Map<String, Object> laytime(HttpServletRequest http) {
+        WebAuth.requireRole(http, Role.DISPATCHER, Role.ADMIN);
+        return replayService.runLaytime();
+    }
+
     @PostMapping("/full")
     public Map<String, Object> full(HttpServletRequest http) {
         WebAuth.requireRole(http, Role.DISPATCHER, Role.ADMIN);
         Map<String, Object> all = new LinkedHashMap<>();
         all.put("orderings", replayService.runOrderings());
         all.put("disruptions", replayService.runDisruptions());
+        all.put("laytime", replayService.runLaytime());
         boolean pass = Boolean.TRUE.equals(((Map<?, ?>) all.get("orderings")).get("allPassed"))
-                && Boolean.TRUE.equals(((Map<?, ?>) all.get("disruptions")).get("allPassed"));
+                && Boolean.TRUE.equals(((Map<?, ?>) all.get("disruptions")).get("allPassed"))
+                && Boolean.TRUE.equals(((Map<?, ?>) all.get("laytime")).get("allPassed"));
         all.put("allPassed", pass);
         return all;
     }
